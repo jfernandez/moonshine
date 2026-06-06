@@ -2818,7 +2818,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.3.0"
-source = "git+https://github.com/jfernandez/pixelforge?rev=debcc0566177cdec69416ae43599c3349478a7f2#debcc0566177cdec69416ae43599c3349478a7f2"
+source = "git+https://github.com/jfernandez/pixelforge?rev=5f7b4218a5affc8ecd25773b3db75eb4b5ca24cf#5f7b4218a5affc8ecd25773b3db75eb4b5ca24cf"
 dependencies = [
  "ash",
  "shaderc",

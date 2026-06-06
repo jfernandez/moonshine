@@ -75,7 +75,7 @@ xcursor = "0.3.10"
 wayland-scanner = "0.31"
 
 # Session (video stream)
-pixelforge = { git = "https://github.com/jfernandez/pixelforge", rev = "debcc0566177cdec69416ae43599c3349478a7f2", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/jfernandez/pixelforge", rev = "5f7b4218a5affc8ecd25773b3db75eb4b5ca24cf", features = ["dmabuf"] }
 
 # Session (audio stream)
 opus = "0.3.1"
