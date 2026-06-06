@@ -75,7 +75,9 @@ xcursor = "0.3.10"
 wayland-scanner = "0.31"
 
 # Session (video stream)
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "fc60c32", features = ["dmabuf"] }
+# Fork pin: carries ColorConverter::invalidate_source; re-point to
+# hgaiser/pixelforge once that merges upstream.
+pixelforge = { git = "https://github.com/jfernandez/pixelforge", rev = "eefd61960dc6b67271968836f0c21df09cef08e7", features = ["dmabuf"] }
 
 # Session (audio stream)
 opus = "0.3.1"

@@ -445,6 +445,15 @@ impl VideoPipelineInner {
 					},
 				};
 
+				// The converter caches its source view by raw image handle,
+				// which Vulkan may recycle; drop views for anything the
+				// importer destroyed (geometry change or TTL eviction).
+				for image in importer.take_destroyed() {
+					if let Some(ref mut conv) = color_converter {
+						conv.invalidate_source(image);
+					}
+				}
+
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.
 				// Cached imports were left in GENERAL by the previous convert.

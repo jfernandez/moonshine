@@ -3,16 +3,18 @@
 //! This module provides the ability to import Linux DMA-BUF file descriptors as
 //! Vulkan images for direct video encoding without CPU-side copies.
 //!
-//! `DmaBufImporter` caches imported Vulkan resources per compositor buffer index
-//! so that pre-allocated GBM buffers are imported only once. Subsequent frames
-//! from the same buffer reuse the cached `VkImage` and `VkDeviceMemory`,
-//! eliminating per-frame Vulkan object creation and layout transitions.
+//! `DmaBufImporter` caches imported Vulkan resources per DMA-BUF, keyed by
+//! the buffer's inode (`st_ino` of the plane-0 fd). The inode is stable
+//! across `wl_buffer` re-wraps, so a client cycling a fixed pool of buffers
+//! (mpv, gamescope) hits the cache even when it hands the compositor a fresh
+//! `wl_buffer` every frame.
 //!
-//! The cache evicts entries that have not been touched in `CACHE_TTL`. During
-//! real-game streaming, gamescope assigns monotonically-growing `buffer_index`
-//! values (~76/sec at 120 fps), so without eviction the cache (and its backing
-//! VRAM) would grow unboundedly across a session. With TTL eviction, only the
-//! actively-cycling buffers stay resident; old indexes are reclaimed.
+//! Hits validate the import's geometry (size, format, modifier), so a
+//! re-wrapped or (on older kernels) recycled inode is re-imported instead of
+//! encoded from the wrong image. Entries unused for `CACHE_TTL` are evicted
+//! a couple per call so destruction never bursts on the frame path, and
+//! destroyed handles are reported via `take_destroyed` so the caller can
+//! drop view caches keyed by them before Vulkan recycles a handle.
 
 use ash::vk;
 use pixelforge::VideoContext;
@@ -24,14 +26,14 @@ use tracing::{debug, trace};
 
 /// How long a cached import stays resident after its last use before being
 /// evicted and freed. Long enough that any in-flight encoder/blitter work
-/// using the image has definitely completed (depth-2 pipeline at 120 fps is
-/// ~16 ms of in-flight latency), short enough that monotonically-growing
-/// buffer-index churn doesn't accumulate VRAM.
+/// using the image has definitely completed.
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// Sweep for stale cache entries every N `import_or_reuse` calls. Cheap
-/// (HashMap retain over a small map) but no point doing it every frame.
-const SWEEP_INTERVAL_CALLS: u32 = 60;
+/// Evict at most this many stale entries per `import_or_reuse` call. Each
+/// call inserts at most one entry and can retire two, so the cache stays
+/// bounded while freeing device memory (a slow driver call) never bursts
+/// on the frame path like a periodic sweep would.
+const MAX_EVICTIONS_PER_CALL: usize = 2;
 
 /// Information about a single DMA-BUF plane.
 #[derive(Debug, Clone, Copy)]
@@ -46,27 +48,49 @@ pub(crate) struct DmaBufPlane {
 	pub modifier: u64,
 }
 
-/// Cached Vulkan resources for a single compositor buffer slot.
+/// Cached Vulkan resources for a single DMA-BUF.
 struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	last_used: Instant,
+	/// Import geometry, validated on every cache hit.
+	width: u32,
+	height: u32,
+	format: vk::Format,
+	modifier: u64,
 }
 
 /// Importer for DMA-BUF file descriptors into Vulkan images.
 ///
-/// Owns a per-buffer-index cache of `VkImage` + `VkDeviceMemory` with TTL
+/// Owns a per-buffer cache of `VkImage` + `VkDeviceMemory` with TTL
 /// eviction. Layout transitions are deferred to the consumer
 /// (e.g. `ColorConverter`/`RgbBlitter`) to avoid a separate GPU submission
 /// per first-time import.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Per-buffer-index cache. Switched from `Vec<Option<…>>` to a HashMap so
-	/// monotonically-growing `buffer_index` values don't grow a sparse Vec.
-	cache: HashMap<usize, CachedImport>,
-	/// Calls since the last stale-entry sweep.
-	calls_since_sweep: u32,
+	/// Keyed by the DMA-BUF's inode; the compositor's buffer index churns
+	/// every frame for re-wrapping clients.
+	cache: HashMap<u64, CachedImport>,
+	/// Images destroyed since the caller last called `take_destroyed`.
+	destroyed: Vec<vk::Image>,
+}
+
+/// Inode of the DMA-BUF behind `fd`, shared by every fd/`wl_buffer` that
+/// wraps the same buffer object. Plane 0 suffices; the per-hit geometry
+/// validation catches any mismatch.
+fn dmabuf_inode(fd: RawFd) -> Result<u64, String> {
+	let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+	// SAFETY: fstat writes the stat buffer for a valid fd; the return code
+	// is checked before assuming initialization.
+	let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+	if rc != 0 {
+		return Err(format!(
+			"fstat on DMA-BUF fd {fd} failed: {}",
+			std::io::Error::last_os_error()
+		));
+	}
+	Ok(unsafe { stat.assume_init() }.st_ino)
 }
 
 impl DmaBufImporter {
@@ -78,12 +102,13 @@ impl DmaBufImporter {
 			context,
 			external_memory_fd,
 			cache: HashMap::new(),
-			calls_since_sweep: 0,
+			destroyed: Vec::new(),
 		})
 	}
 
-	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
-	/// the same `buffer_index` has been seen before.
+	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when the
+	/// same buffer (by inode) has been seen before. `buffer_index` is the
+	/// compositor's per-`wl_buffer` index, used only for log correlation.
 	///
 	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
 	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
@@ -101,63 +126,97 @@ impl DmaBufImporter {
 		format: vk::Format,
 		planes: &[DmaBufPlane],
 	) -> Result<(vk::Image, bool), String> {
-		self.calls_since_sweep += 1;
-		if self.calls_since_sweep >= SWEEP_INTERVAL_CALLS {
-			self.calls_since_sweep = 0;
-			self.evict_stale();
-		}
+		self.evict_stale();
 
+		// An fstat failure drops this frame; the next one recovers.
+		let inode = dmabuf_inode(planes[0].fd)?;
 		let now = Instant::now();
-		if let Some(cached) = self.cache.get_mut(&buffer_index) {
-			cached.last_used = now;
-			return Ok((cached.image, false));
+		let modifier = planes[0].modifier;
+		if let Some(cached) = self.cache.get_mut(&inode) {
+			if cached.width == width && cached.height == height && cached.format == format && cached.modifier == modifier {
+				cached.last_used = now;
+				return Ok((cached.image, false));
+			}
+			// Same inode, different geometry: the client re-wrapped the same
+			// buffer with different parameters (or an older kernel recycled
+			// the inode). Destroy the stale import and import fresh.
+			let stale = self
+				.cache
+				.remove(&inode)
+				.expect("present: get_mut above found it");
+			let device = self.context.device();
+			unsafe {
+				device.destroy_image(stale.image, None);
+				device.free_memory(stale.memory, None);
+			}
+			self.destroyed.push(stale.image);
 		}
 
 		// First time seeing this buffer — full import.
 		debug!(
-			"First import for buffer {buffer_index}: {}x{}, format={:?}, fd={}, stride={}, modifier={:#x}",
+			"First import for buffer {buffer_index} (inode {inode}): {}x{}, format={:?}, fd={}, stride={}, modifier={:#x}",
 			width, height, format, planes[0].fd, planes[0].stride, planes[0].modifier
 		);
 
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
 		self.cache.insert(
-			buffer_index,
+			inode,
 			CachedImport {
 				image,
 				memory,
 				last_used: now,
+				width,
+				height,
+				format,
+				modifier,
 			},
 		);
 		Ok((image, true))
 	}
 
-	/// Drop cached entries that haven't been touched in `CACHE_TTL` and free
-	/// their backing Vulkan resources. Stale entries are guaranteed to be out
-	/// of any encoder/blitter pipeline (TTL >> max in-flight depth at 120 fps),
-	/// so it's safe to destroy without an explicit fence wait.
+	/// Drop up to `MAX_EVICTIONS_PER_CALL` entries that haven't been touched
+	/// in `CACHE_TTL` and free their backing Vulkan resources. Stale entries
+	/// are long out of any encoder/blitter pipeline (TTL >> max in-flight
+	/// depth), so no fence wait is needed.
 	fn evict_stale(&mut self) {
 		let cutoff = Instant::now() - CACHE_TTL;
-		let device = self.context.device();
-		let before = self.cache.len();
-		self.cache.retain(|_, v| {
+		let mut victims: [Option<u64>; MAX_EVICTIONS_PER_CALL] = [None; MAX_EVICTIONS_PER_CALL];
+		let mut found = 0;
+		for (k, v) in &self.cache {
 			if v.last_used < cutoff {
-				unsafe {
-					device.destroy_image(v.image, None);
-					device.free_memory(v.memory, None);
+				victims[found] = Some(*k);
+				found += 1;
+				if found == MAX_EVICTIONS_PER_CALL {
+					break;
 				}
-				false
-			} else {
-				true
 			}
-		});
-		let evicted = before - self.cache.len();
-		if evicted > 0 {
-			trace!(
-				"DmaBufImporter: evicted {evicted} stale cache entries, {} live",
-				self.cache.len()
-			);
 		}
+		if found == 0 {
+			return;
+		}
+		let device = self.context.device();
+		for key in victims.into_iter().flatten() {
+			let v = self
+				.cache
+				.remove(&key)
+				.expect("victim was collected from the map earlier this call");
+			unsafe {
+				device.destroy_image(v.image, None);
+				device.free_memory(v.memory, None);
+			}
+			self.destroyed.push(v.image);
+		}
+		trace!(
+			"DmaBufImporter: evicted {found} stale cache entries, {} live",
+			self.cache.len()
+		);
+	}
+
+	/// Images destroyed since the last call, for the caller to invalidate
+	/// any handle-keyed view caches before Vulkan recycles the handles.
+	pub fn take_destroyed(&mut self) -> Vec<vk::Image> {
+		std::mem::take(&mut self.destroyed)
 	}
 
 	/// Perform the raw Vulkan import of a DMA-BUF with the specified format.
