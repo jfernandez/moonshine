@@ -157,10 +157,7 @@ impl DmaBufImporter {
 			// evict_stale's is: the converter's convert() fence-waits before
 			// returning, so by the time the next frame imports, no GPU work
 			// references this image.
-			let stale = self
-				.cache
-				.remove(&inode)
-				.expect("present: get_mut above found it");
+			let stale = self.cache.remove(&inode).expect("present: get_mut above found it");
 			self.destroy_entry(stale);
 		}
 
