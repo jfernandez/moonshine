@@ -9,9 +9,9 @@
 //! (mpv, gamescope) hits the cache even when it hands the compositor a fresh
 //! `wl_buffer` every frame.
 //!
-//! Hits validate the import's geometry (size, format, modifier), so a
-//! re-wrapped or (on older kernels) recycled inode is re-imported instead of
-//! encoded from the wrong image. Entries unused for `CACHE_TTL` are evicted
+//! Hits validate the import's geometry (size, format, modifier, plane-0
+//! offset and stride), so a re-wrapped or (on older kernels) recycled inode
+//! is re-imported instead of encoded from the wrong image. Entries unused for `CACHE_TTL` are evicted
 //! a couple per call so destruction never bursts on the frame path, and
 //! destroyed handles are reported via `take_destroyed` so the caller can
 //! drop view caches keyed by them before Vulkan recycles a handle.
@@ -53,19 +53,24 @@ struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	last_used: Instant,
-	/// Import geometry, validated on every cache hit.
+	/// Import geometry, validated on every cache hit. Offset and stride are
+	/// part of it: two buffers suballocated from the same BO share an inode
+	/// and can agree on size/format/modifier while living at different
+	/// offsets.
 	width: u32,
 	height: u32,
 	format: vk::Format,
 	modifier: u64,
+	offset: u32,
+	stride: u32,
 }
 
 /// Importer for DMA-BUF file descriptors into Vulkan images.
 ///
 /// Owns a per-buffer cache of `VkImage` + `VkDeviceMemory` with TTL
 /// eviction. Layout transitions are deferred to the consumer
-/// (e.g. `ColorConverter`/`RgbBlitter`) to avoid a separate GPU submission
-/// per first-time import.
+/// (the `ColorConverter`) to avoid a separate GPU submission per
+/// first-time import.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
@@ -132,24 +137,31 @@ impl DmaBufImporter {
 		let inode = dmabuf_inode(planes[0].fd)?;
 		let now = Instant::now();
 		let modifier = planes[0].modifier;
+		let offset = planes[0].offset;
+		let stride = planes[0].stride;
 		if let Some(cached) = self.cache.get_mut(&inode) {
-			if cached.width == width && cached.height == height && cached.format == format && cached.modifier == modifier {
+			if cached.width == width
+				&& cached.height == height
+				&& cached.format == format
+				&& cached.modifier == modifier
+				&& cached.offset == offset
+				&& cached.stride == stride
+			{
 				cached.last_used = now;
 				return Ok((cached.image, false));
 			}
 			// Same inode, different geometry: the client re-wrapped the same
 			// buffer with different parameters (or an older kernel recycled
-			// the inode). Destroy the stale import and import fresh.
+			// the inode). Destroy the stale import and import fresh. The
+			// immediate destroy (no TTL grace) is safe for the same reason
+			// evict_stale's is: the converter's convert() fence-waits before
+			// returning, so by the time the next frame imports, no GPU work
+			// references this image.
 			let stale = self
 				.cache
 				.remove(&inode)
 				.expect("present: get_mut above found it");
-			let device = self.context.device();
-			unsafe {
-				device.destroy_image(stale.image, None);
-				device.free_memory(stale.memory, None);
-			}
-			self.destroyed.push(stale.image);
+			self.destroy_entry(stale);
 		}
 
 		// First time seeing this buffer — full import.
@@ -170,9 +182,24 @@ impl DmaBufImporter {
 				height,
 				format,
 				modifier,
+				offset,
+				stride,
 			},
 		);
 		Ok((image, true))
+	}
+
+	/// Free an entry's Vulkan resources and record the image handle for
+	/// `take_destroyed`. The push is load-bearing: every destroy path must
+	/// report the handle, or the converter's handle-keyed source view goes
+	/// stale when Vulkan recycles it.
+	fn destroy_entry(&mut self, entry: CachedImport) {
+		let device = self.context.device();
+		unsafe {
+			device.destroy_image(entry.image, None);
+			device.free_memory(entry.memory, None);
+		}
+		self.destroyed.push(entry.image);
 	}
 
 	/// Drop up to `MAX_EVICTIONS_PER_CALL` entries that haven't been touched
@@ -195,17 +222,12 @@ impl DmaBufImporter {
 		if found == 0 {
 			return;
 		}
-		let device = self.context.device();
 		for key in victims.into_iter().flatten() {
 			let v = self
 				.cache
 				.remove(&key)
 				.expect("victim was collected from the map earlier this call");
-			unsafe {
-				device.destroy_image(v.image, None);
-				device.free_memory(v.memory, None);
-			}
-			self.destroyed.push(v.image);
+			self.destroy_entry(v);
 		}
 		trace!(
 			"DmaBufImporter: evicted {found} stale cache entries, {} live",
