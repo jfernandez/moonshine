@@ -9,22 +9,38 @@
 //! eliminating per-frame `vkCreateImage` + `vkAllocateMemory(DMA-BUF import)`
 //! calls that can cost 0.5\u20131.5ms on NVIDIA drivers.
 //!
-//! Keying by FD rather than `wl_buffer` ObjectId is critical: the NVIDIA
-//! Wayland WSI creates a new `wl_buffer` wrapper each frame even though the
-//! underlying DMA-BUF fd is stable. ObjectId-keying would miss the cache
-//! every frame; FD-keying catches the reuse.
+//! Keying by `wl_buffer` ObjectId does not work: the NVIDIA Wayland WSI creates
+//! a new `wl_buffer` wrapper each frame even though the underlying buffer is
+//! stable, so ObjectId-keying would miss the cache every frame. The fd is
+//! stable across those wrappers, but fd *numbers* are recycled for unrelated
+//! buffers once closed (e.g. a swapchain recreation when a game switches HDR
+//! format), so a different buffer can land an in-use cache slot. Validating the
+//! import parameters on a hit rejects most of those, but a recycled fd that
+//! happens to match the previous buffer's geometry would still be served a
+//! stale `VkImage`, and the GPU then reads freed/foreign memory — a device-lost
+//! fault.
 //!
-//! The kernel also recycles fd numbers for *new* buffers (e.g. when a game
-//! recreates its swapchain after switching HDR format from PQ to scRGB), so a
-//! cache hit on the fd alone may actually be a different buffer. A hit is only
-//! trusted when the import parameters (dimensions, format, plane layout,
-//! modifier) also match; mismatched entries are retired and freed after
-//! `CACHE_TTL`, once any in-flight GPU work using them has completed.
+//! So the cache is keyed by the buffer's *inode* (`st_ino` of the DMA-BUF fd),
+//! which identifies the underlying buffer object and is not recycled while the
+//! buffer lives, so it cannot alias a different buffer the way an fd number
+//! can. The import-parameter check is kept as defence-in-depth — and to catch
+//! inode reuse after a buffer is freed and a new one allocated at the same
+//! inode: a hit must match both the inode and the import parameters. Mismatched
+//! entries are retired and freed after `CACHE_TTL`, once any in-flight GPU work
+//! using them has completed.
 //!
 //! The cache evicts entries that have not been touched in `CACHE_TTL`. The
 //! compositor holds client buffers alive until the encoder signals `consumed`,
 //! so the fd is guaranteed valid during import. The 2s TTL ensures any
 //! in-flight GPU work completes before cached Vulkan resources are freed.
+//!
+//! REQUIRES Linux >= 5.3. Per-buffer DMA-BUF inodes only exist from 5.3 (the
+//! change that made `fstat` on a DMA-BUF meaningful); before that every
+//! DMA-BUF shares one anonymous inode, so the key would collapse to a single
+//! value and alias distinct buffers — strictly worse than fd-keying. The cache
+//! cannot distinguish a genuine reuse from a shared-inode alias once it
+//! happens, so this is guarded once up front: `DmaBufImporter::new` reads the
+//! kernel version and warns loudly on a pre-5.3 host.
 
 use ash::vk;
 use pixelforge::VideoContext;
@@ -45,6 +61,47 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 /// (HashMap retain over a small map) but no point doing it every frame.
 const SWEEP_INTERVAL_CALLS: u32 = 60;
 
+/// `st_ino` of the DMA-BUF fd: the cache key. The inode identifies the
+/// underlying buffer object and is stable across the per-frame `wl_buffer`
+/// wrappers, while not aliasing a different buffer the way a recycled fd
+/// number can. Plane 0's fd suffices; the per-hit parameter check catches any
+/// mismatch.
+fn dmabuf_inode(fd: RawFd) -> Result<u64, String> {
+	let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+	// SAFETY: fstat writes the stat buffer for a valid fd; the return code is
+	// checked before assuming the buffer is initialized.
+	let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+	if rc != 0 {
+		return Err(format!(
+			"fstat on DMA-BUF fd {fd} failed: {}",
+			std::io::Error::last_os_error()
+		));
+	}
+	Ok(unsafe { stat.assume_init() }.st_ino)
+}
+
+/// Warn once at startup if the kernel predates per-buffer DMA-BUF inodes
+/// (Linux 5.3). On such a kernel every DMA-BUF shares one anonymous inode, so
+/// the import cache's inode key collides across distinct buffers and may serve
+/// the wrong image — a regression this cache cannot detect at runtime, hence
+/// the up-front check. Fails open: an unparseable version is left un-warned
+/// rather than producing a false alarm.
+fn warn_if_dmabuf_inodes_unsupported() {
+	let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+	let mut parts = release.trim().split('.');
+	let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+	let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+	// major == 0 means we couldn't read/parse the version; don't warn on that.
+	if major != 0 && (major, minor) < (5, 3) {
+		tracing::warn!(
+			"kernel {} predates Linux 5.3, where DMA-BUFs share a single inode: the zero-copy \
+			 import cache keys collide across buffers and may serve the wrong frame (corruption \
+			 or device-lost). Upgrade to Linux 5.3+ for DMA-BUF capture.",
+			release.trim()
+		);
+	}
+}
+
 /// Information about a single DMA-BUF plane.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DmaBufPlane {
@@ -59,8 +116,8 @@ pub(crate) struct DmaBufPlane {
 }
 
 /// Identifying parameters of a DMA-BUF import. A cached image may only be
-/// reused when all of these match the new request; a mismatch on the same fd
-/// means the fd number was recycled for a different buffer.
+/// reused when all of these match the new request; a mismatch on the same inode
+/// means the inode now maps to a different buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ImportParams {
 	width: u32,
@@ -99,17 +156,19 @@ struct CachedImport {
 
 /// Importer for DMA-BUF file descriptors into Vulkan images.
 ///
-/// Owns a per-FD cache of `VkImage` + `VkDeviceMemory` with TTL eviction.
+/// Owns a per-buffer cache of `VkImage` + `VkDeviceMemory` (keyed by inode)
+/// with TTL eviction.
 /// Layout transitions are deferred to the consumer (e.g. `ColorConverter`)
 /// to avoid a separate GPU submission per first-time import.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Per-FD cache — keyed by the DMA-BUF fd so the same underlying buffer
-	/// is reused even when the driver wraps it in new `wl_buffer` objects.
-	cache: HashMap<RawFd, CachedImport>,
-	/// Imports whose fd was recycled for a different buffer, awaiting TTL
-	/// expiry before destruction (in-flight GPU work may still reference them).
+	/// Per-buffer cache — keyed by the DMA-BUF inode so the same underlying
+	/// buffer is reused even when the driver wraps it in new `wl_buffer`
+	/// objects, without a recycled fd number aliasing a different buffer.
+	cache: HashMap<u64, CachedImport>,
+	/// Imports whose inode now maps to a different buffer, awaiting TTL expiry
+	/// before destruction (in-flight GPU work may still reference them).
 	retired: Vec<CachedImport>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
@@ -118,6 +177,7 @@ pub(crate) struct DmaBufImporter {
 impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
 	pub fn new(context: VideoContext) -> Result<Self, String> {
+		warn_if_dmabuf_inodes_unsupported();
 		let external_memory_fd = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
 
 		Ok(Self {
@@ -130,7 +190,7 @@ impl DmaBufImporter {
 	}
 
 	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
-	/// the same DMA-BUF fd has been seen before with the same parameters.
+	/// the same DMA-BUF (by inode) has been seen before with the same parameters.
 	///
 	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
 	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
@@ -155,23 +215,26 @@ impl DmaBufImporter {
 		}
 
 		let params = ImportParams::new(width, height, format, planes);
+		let inode = dmabuf_inode(fd)?;
 
 		let now = Instant::now();
-		if let Some(cached) = self.cache.get_mut(&fd) {
+		if let Some(cached) = self.cache.get_mut(&inode) {
 			if cached.params == params {
 				cached.last_used = now;
 				return Ok((cached.image, false));
 			}
 		}
 
-		// A leftover entry here means the fd number was recycled for a
-		// different buffer (e.g. a swapchain recreation when the game switches
-		// HDR format). Reusing the stale image would make the GPU read the old
-		// buffer with the wrong format/stride — a device-lost fault. Retire it
-		// for TTL-deferred destruction in case prior GPU work still uses it.
-		if let Some(mut stale) = self.cache.remove(&fd) {
+		// A leftover entry whose parameters no longer match means this inode now
+		// refers to a different buffer — e.g. the buffer was freed and its inode
+		// reallocated, or the same buffer changed geometry (a swapchain
+		// recreation when the game switches HDR format). Reusing the stale image
+		// would make the GPU read the old buffer with the wrong format/stride —
+		// a device-lost fault. Retire it for TTL-deferred destruction in case
+		// prior GPU work still uses it.
+		if let Some(mut stale) = self.cache.remove(&inode) {
 			debug!(
-				"fd {fd} now refers to a different buffer ({:?} -> {:?}); retiring stale import",
+				"inode {inode} now refers to a different buffer ({:?} -> {:?}); retiring stale import",
 				stale.params, params
 			);
 			stale.last_used = now;
@@ -187,7 +250,7 @@ impl DmaBufImporter {
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
 		self.cache.insert(
-			fd,
+			inode,
 			CachedImport {
 				image,
 				memory,
